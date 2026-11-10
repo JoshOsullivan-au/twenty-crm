@@ -1,0 +1,57 @@
+name: Sync upstream weekly
+
+# Keeps this fork's main branch and Twenty release tags (twenty/v*) current with twentyhq/twenty.
+# It uses the GitHub API only (merge-upstream and git refs), so it needs no clone and no third-party action.
+# A new tag on this fork fires the repository's webhooks (push and create events).
+
+on:
+  schedule:
+    - cron: "0 18 * * 0" # Sunday 18:00 UTC = Monday 02:00 WITA
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+      FORK: ${{ github.repository }}
+      UPSTREAM: twentyhq/twenty
+    steps:
+      - name: Check token
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Add the SYNC_TOKEN secret: a fine-grained token on this repository with Contents and Workflows read and write."
+            exit 1
+          fi
+
+      - name: Merge upstream main
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/$FORK/merge-upstream" -f branch=main \
+            --jq '"main: \(.merge_type) (\(.message))"' | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Copy new release tags
+        run: |
+          set -euo pipefail
+          have="$(gh api --paginate "repos/$FORK/git/matching-refs/tags/twenty/" --jq '.[].ref')"
+          added=0
+          for tag in $(gh api "repos/$UPSTREAM/releases?per_page=30" \
+              --jq '.[] | select(.draft | not) | select(.tag_name | startswith("twenty/v")) | .tag_name'); do
+            if grep -qx "refs/tags/$tag" <<<"$have"; then
+              continue
+            fi
+            sha="$(gh api "repos/$UPSTREAM/commits/$tag" --jq .sha)"
+            gh api -X POST "repos/$FORK/git/refs" -f ref="refs/tags/$tag" -f sha="$sha" >/dev/null
+            echo "added $tag at $sha" | tee -a "$GITHUB_STEP_SUMMARY"
+            added=$((added + 1))
+          done
+          latest="$(gh api "repos/$UPSTREAM/releases/latest" --jq .tag_name)"
+          echo "new tags: $added, latest upstream release: $latest" | tee -a "$GITHUB_STEP_SUMMARY"
